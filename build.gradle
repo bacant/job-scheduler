@@ -1,0 +1,51 @@
+plugins {
+    id 'groovy'
+    id 'java-library'
+}
+
+group = 'de.example'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.codehaus.groovy:groovy:3.0.21'
+    implementation 'org.codehaus.groovy:groovy-sql:3.0.21'
+    implementation 'org.codehaus.groovy:groovy-json:3.0.21'
+    implementation 'org.slf4j:slf4j-api:1.7.36'
+
+    testImplementation 'org.spockframework:spock-core:2.3-groovy-3.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'com.h2database:h2:2.1.214'
+    testRuntimeOnly 'org.slf4j:slf4j-simple:1.7.36'
+}
+
+// NOTE: The target platform is JDK 8 (bytecode 1.8). In this build the Groovy
+// compiler emits 1.8 bytecode via targetBytecode; javac uses --release 8.
+sourceSets {
+    main {
+        groovy {
+            // Keep the runnable examples compile-verified as part of the build.
+            srcDirs += 'examples'
+        }
+    }
+}
+
+tasks.withType(GroovyCompile).configureEach {
+    groovyOptions.optimizationOptions.indy = false
+    options.release = 8
+    groovyOptions.parameters = false
+    sourceCompatibility = '1.8'
+    targetCompatibility = '1.8'
+    groovyOptions.fork = true
+}
+
+compileJava {
+    options.release = 8
+}
+
+test {
+    useJUnitPlatform()
+}
