@@ -307,6 +307,9 @@ class GronScheduler implements TaskScheduler {
                     inflight.put(run.claimToken, run)
                     dispatch(run, 1)
                 }
+                if (due.size() >= batchLimit) {
+                    continue   // batch was full; more work likely due — claim again now
+                }
                 sleepUntilNextDue()
             } catch (Throwable t) {
                 if (running) {
@@ -325,9 +328,13 @@ class GronScheduler implements TaskScheduler {
         } else {
             waitMs = Duration.between(clock.instant(), next).toMillis()
             if (waitMs <= 0L) {
-                return   // more work is due; loop again immediately
+                // A run is due but was not claimable by this node (e.g. a node
+                // selector on a shared store). Sleep a short floor to avoid a
+                // busy spin; a signal still wakes us immediately.
+                waitMs = Math.min(maxSleep.toMillis(), 100L)
+            } else {
+                waitMs = Math.min(waitMs, maxSleep.toMillis())
             }
-            waitMs = Math.min(waitMs, maxSleep.toMillis())
         }
         synchronized (signalMonitor) {
             if (!signalled && waitMs > 0L) {
