@@ -25,9 +25,11 @@ dependencies {
 // NOTE: The target platform is JDK 8 (bytecode 1.8). In this build the Groovy
 // compiler emits 1.8 bytecode via targetBytecode; javac uses --release 8.
 sourceSets {
-    main {
+    test {
         groovy {
             // Keep the runnable examples compile-verified as part of the build.
+            // They live in the test source set because ClusterDemo/PersistenceDemo
+            // use the test-scope H2 driver; the core library itself needs neither.
             srcDirs += 'examples'
         }
     }
