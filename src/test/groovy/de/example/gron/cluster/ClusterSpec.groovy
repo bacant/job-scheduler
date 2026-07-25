@@ -120,6 +120,12 @@ class ClusterSpec extends Specification {
                     ['dead-token']).C == 0
         }
 
+        and: 'the recovery run is recorded in history with recovered == true'
+        poll.eventually {
+            a.historyOf('recover-me', 10).any { it.recovered && it.plannedTime != null }
+        }
+        a.metricsSnapshot().counter('gron.runs.recovered') >= 1
+
         cleanup:
         sql.close()
     }
