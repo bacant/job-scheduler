@@ -13,6 +13,19 @@ import de.example.gron.api.TaskScheduler
 import de.example.gron.api.TaskState
 import de.example.gron.api.UnsupportedPlacementException
 import de.example.gron.cluster.SingleNodeCoordinator
+import de.example.gron.history.AsyncHistoryWriter
+import de.example.gron.history.HistoryMode
+import de.example.gron.history.HistoryPolicy
+import de.example.gron.history.HistoryQuery
+import de.example.gron.history.HistoryStore
+import de.example.gron.history.MemoryHistoryStore
+import de.example.gron.history.RunRecord
+import de.example.gron.metrics.MetricCounter
+import de.example.gron.metrics.MetricTimer
+import de.example.gron.metrics.MetricsCollector
+import de.example.gron.metrics.MetricsSnapshot
+import de.example.gron.metrics.ReadableMetrics
+import de.example.gron.metrics.SimpleMetrics
 import de.example.gron.replication.NoOpReplicationProvider
 import de.example.gron.spi.AdHocRunSupport
 import de.example.gron.spi.ClusterCoordinator
@@ -26,6 +39,7 @@ import de.example.gron.spi.Serializer
 import de.example.gron.spi.Signaler
 import de.example.gron.spi.SkipSink
 import de.example.gron.spi.StoreContext
+import de.example.gron.spi.StoreStats
 import de.example.gron.spi.TaskChangeEvent
 import de.example.gron.spi.TaskStore
 import de.example.gron.store.memory.MemoryTaskStore
@@ -33,6 +47,8 @@ import groovy.transform.CompileStatic
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
@@ -48,21 +64,21 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.function.Consumer
+import java.util.function.Supplier
 
 /**
  * The default {@link TaskScheduler}. A single control thread claims due runs
- * from the {@link TaskStore} in batches and hands them to a worker pool; a
- * maintenance thread drives heartbeats and fail-over.
+ * from the {@link TaskStore} in batches and hands them to a bounded worker pool;
+ * a maintenance thread drives heartbeats, fail-over and history retention.
  *
- * <p><strong>Lock ordering:</strong> the scheduler never holds its own monitors
- * while calling into the store, and the store never calls back while holding its
- * lock (skips and signals are dispatched after unlocking). The wake-up monitor
- * ({@code signalMonitor}) is a leaf. This ordering — scheduler → store, with no
- * reverse edge — keeps the loop, workers and store deadlock-free.</p>
+ * <p><strong>Throughput.</strong> The loop never claims more than the free
+ * worker capacity ({@code claimBatch} capped by open slots), so claims are never
+ * hoarded. History is written asynchronously and metrics use lock-free adders,
+ * so neither slows the run path. Hot-path methods are {@code @CompileStatic}.</p>
  *
- * <p>The worker pool is a plain {@link ThreadPoolExecutor} with a configurable
- * size and {@code gron-worker-N} thread names. A thread-pool SPI is
- * deliberately omitted: the pool has one job and a size knob covers it.</p>
+ * <p><strong>Lock ordering:</strong> scheduler → store, with no reverse edge;
+ * the store never calls back while holding its lock. Listeners run inline and
+ * must be fast.</p>
  */
 @CompileStatic
 class GronScheduler implements TaskScheduler {
@@ -72,7 +88,9 @@ class GronScheduler implements TaskScheduler {
     private final String name
     private final String nodeId
     private final int workers
-    private final int batchLimit
+    private final int claimBatch
+    private final int workerQueue
+    private final int maxInflight
     private final TaskStore store
     private final ClusterCoordinator coordinator
     private final ReplicationProvider replication
@@ -82,11 +100,29 @@ class GronScheduler implements TaskScheduler {
     private final ClassLoader classLoader
     private final Duration maintenanceInterval
     private final Duration maxSleep
+    private final MetricsCollector metrics
+    private final HistoryStore historyStore
+    private final HistoryPolicy historyPolicy
 
     private final List<TaskListener> listeners = new CopyOnWriteArrayList<>()
     private final Map<String, TaskContext> activeContexts = new ConcurrentHashMap<>()
     private final Map<String, DueRun> inflight = new ConcurrentHashMap<>()
     private final AtomicLong sequence = new AtomicLong(0L)
+
+    private AsyncHistoryWriter historyWriter
+
+    // Cached hot-path metric handles (tag values that never change per scheduler).
+    private MetricCounter mStarted
+    private MetricCounter mCompletedOk
+    private MetricCounter mCompletedFailed
+    private MetricCounter mRetried
+    private MetricCounter mRecovered
+    private MetricCounter mSkipOverlap
+    private MetricCounter mSkipOverdue
+    private MetricTimer mDurationOk
+    private MetricTimer mDurationFailed
+    private MetricTimer mStoreClaim
+    private MetricTimer mStoreComplete
 
     private volatile boolean running = false
     private Thread controlThread
@@ -97,15 +133,19 @@ class GronScheduler implements TaskScheduler {
     private final Object signalMonitor = new Object()
     private boolean signalled = false
 
-    protected GronScheduler(String name, String nodeId, int workers, int batchLimit,
+    protected GronScheduler(String name, String nodeId, int workers, int claimBatch, int workerQueue,
                             TaskStore store, ClusterCoordinator coordinator,
                             ReplicationProvider replication, Serializer serializer,
                             HandlerFactory handlerFactory, Clock clock, ClassLoader classLoader,
-                            Duration maintenanceInterval, Duration maxSleep) {
+                            Duration maintenanceInterval, Duration maxSleep,
+                            MetricsCollector metrics, HistoryStore historyStore,
+                            HistoryPolicy historyPolicy) {
         this.name = name
         this.nodeId = nodeId
         this.workers = workers
-        this.batchLimit = batchLimit
+        this.claimBatch = claimBatch
+        this.workerQueue = workerQueue
+        this.maxInflight = workers + workerQueue
         this.store = store
         this.coordinator = coordinator
         this.replication = replication
@@ -115,9 +155,11 @@ class GronScheduler implements TaskScheduler {
         this.classLoader = classLoader
         this.maintenanceInterval = maintenanceInterval
         this.maxSleep = maxSleep
+        this.metrics = metrics
+        this.historyStore = historyStore
+        this.historyPolicy = historyPolicy
     }
 
-    /** @return a new scheduler builder. */
     static Builder builder() {
         return new Builder()
     }
@@ -135,6 +177,8 @@ class GronScheduler implements TaskScheduler {
         if (running) {
             return
         }
+        cacheMetricHandles()
+
         Signaler signaler = new Signaler() {
             @Override
             void signal() { wakeLoop() }
@@ -142,10 +186,15 @@ class GronScheduler implements TaskScheduler {
         SkipSink skipSink = new SkipSink() {
             @Override
             void skipped(String taskId, Instant plannedTime, SkipReason reason) {
-                fireSkip(taskId, plannedTime, reason)
+                onSkipped(taskId, plannedTime, reason)
             }
         }
-        store.open(new StoreContext(serializer, clock, classLoader, signaler, skipSink))
+        StoreContext ctx = new StoreContext(serializer, clock, classLoader, signaler, skipSink, metrics)
+        store.open(ctx)
+        historyStore.open(ctx)
+        historyWriter = new AsyncHistoryWriter(historyStore, historyPolicy, metrics)
+        historyWriter.start()
+
         coordinator.start()
         replication.start(new ReplicationContext(serializer, clock, nodeId))
         replication.onRemoteChange(new Consumer<TaskChangeEvent>() {
@@ -155,9 +204,11 @@ class GronScheduler implements TaskScheduler {
 
         running = true
         this.workerPool = new ThreadPoolExecutor(workers, workers, 0L, TimeUnit.MILLISECONDS,
-                new LinkedBlockingQueue<Runnable>(), namedFactory('gron-worker'))
+                new LinkedBlockingQueue<Runnable>(Math.max(1, workerQueue)), namedFactory('gron-worker'))
         this.retryExecutor = new ScheduledThreadPoolExecutor(1, namedFactory('gron-retry'))
         this.maintenanceExecutor = new ScheduledThreadPoolExecutor(1, namedFactory('gron-maint'))
+
+        registerGauges()
 
         this.controlThread = new Thread({ controlLoop() } as Runnable, "gron-loop-${name}")
         controlThread.setDaemon(true)
@@ -166,8 +217,12 @@ class GronScheduler implements TaskScheduler {
         long ms = Math.max(1L, maintenanceInterval.toMillis())
         maintenanceExecutor.scheduleWithFixedDelay({ maintenance() } as Runnable, ms, ms,
                 TimeUnit.MILLISECONDS)
+        long hk = Math.max(1000L, historyPolicy.housekeepingInterval.toMillis())
+        maintenanceExecutor.scheduleWithFixedDelay({ housekeeping() } as Runnable, hk, hk,
+                TimeUnit.MILLISECONDS)
 
-        log.info('GronScheduler {} started as node {} with {} workers', name, nodeId, workers)
+        log.info('GronScheduler {} started as node {} with {} workers (claimBatch={}, queue={})',
+                name, nodeId, workers, claimBatch, workerQueue)
     }
 
     @Override
@@ -190,12 +245,13 @@ class GronScheduler implements TaskScheduler {
         maintenanceExecutor?.shutdownNow()
         retryExecutor?.shutdownNow()
 
+        long awaitMs = awaitRunning == null ? 0L : awaitRunning.toMillis()
         if (awaitRunning == null || awaitRunning.isZero() || awaitRunning.isNegative()) {
             workerPool?.shutdownNow()
         } else {
             workerPool?.shutdown()
             try {
-                if (!workerPool.awaitTermination(awaitRunning.toMillis(), TimeUnit.MILLISECONDS)) {
+                if (!workerPool.awaitTermination(awaitMs, TimeUnit.MILLISECONDS)) {
                     workerPool.shutdownNow()
                 }
             } catch (InterruptedException ignored) {
@@ -204,7 +260,6 @@ class GronScheduler implements TaskScheduler {
             }
         }
 
-        // Release any claims that never ran (or were interrupted).
         for (DueRun run : new ArrayList<DueRun>(inflight.values())) {
             try {
                 store.release(run)
@@ -214,6 +269,10 @@ class GronScheduler implements TaskScheduler {
         }
         inflight.clear()
         activeContexts.clear()
+
+        // Drain the history queue up to the stop timeout, then close.
+        historyWriter?.stop(Math.max(1000L, awaitMs))
+        try { historyStore.close() } catch (Exception ignored) { }
 
         try { replication.stop() } catch (Exception ignored) { }
         try { coordinator.stop() } catch (Exception ignored) { }
@@ -295,20 +354,52 @@ class GronScheduler implements TaskScheduler {
     @Override
     void removeListener(TaskListener listener) { listeners.remove(listener) }
 
+    // --------------------------------------------------------- history/metrics
+
+    @Override
+    List<RunRecord> historyOf(String taskId, int limit) {
+        HistoryQuery q = new HistoryQuery()
+        q.taskId = taskId
+        q.limit = limit
+        return historyStore.query(q)
+    }
+
+    @Override
+    List<RunRecord> queryHistory(HistoryQuery query) {
+        return historyStore.query(query)
+    }
+
+    @Override
+    MetricsSnapshot metricsSnapshot() {
+        if (metrics instanceof ReadableMetrics) {
+            return ((ReadableMetrics) metrics).snapshot()
+        }
+        return MetricsSnapshot.empty()
+    }
+
     // ------------------------------------------------------- control loop
 
     private void controlLoop() {
         while (running) {
             try {
+                int capacity = maxInflight - inflight.size()
+                if (capacity <= 0) {
+                    // Fully saturated: do not hoard claims; wait for capacity.
+                    parkFor(Math.min(maxSleep.toMillis(), 50L))
+                    continue
+                }
+                int limit = Math.min(claimBatch, capacity)
                 Instant now = clock.instant()
                 NodeInfo node = coordinator.localNode()
-                List<DueRun> due = store.claimDue(now, batchLimit, node)
+                long t0 = System.nanoTime()
+                List<DueRun> due = store.claimDue(now, limit, node)
+                mStoreClaim.record(System.nanoTime() - t0)
                 for (DueRun run : due) {
                     inflight.put(run.claimToken, run)
-                    dispatch(run, 1)
+                    dispatch(run, 1, false)
                 }
-                if (due.size() >= batchLimit) {
-                    continue   // batch was full; more work likely due — claim again now
+                if (due.size() >= limit && (maxInflight - inflight.size()) > 0) {
+                    continue   // full batch and still capacity: claim again now
                 }
                 sleepUntilNextDue()
             } catch (Throwable t) {
@@ -328,14 +419,15 @@ class GronScheduler implements TaskScheduler {
         } else {
             waitMs = Duration.between(clock.instant(), next).toMillis()
             if (waitMs <= 0L) {
-                // A run is due but was not claimable by this node (e.g. a node
-                // selector on a shared store). Sleep a short floor to avoid a
-                // busy spin; a signal still wakes us immediately.
                 waitMs = Math.min(maxSleep.toMillis(), 100L)
             } else {
                 waitMs = Math.min(waitMs, maxSleep.toMillis())
             }
         }
+        parkFor(waitMs)
+    }
+
+    private void parkFor(long waitMs) {
         synchronized (signalMonitor) {
             if (!signalled && waitMs > 0L) {
                 try {
@@ -357,18 +449,23 @@ class GronScheduler implements TaskScheduler {
 
     // ------------------------------------------------------- execution
 
-    private void dispatch(DueRun run, int attempt) {
+    private void dispatch(DueRun run, int attempt, boolean recovered) {
         try {
-            workerPool.execute({ runOnce(run, attempt) } as Runnable)
+            workerPool.execute({ runOnce(run, attempt, recovered) } as Runnable)
         } catch (RejectedExecutionException e) {
-            // Pool is shutting down; release the claim so it is not lost.
             inflight.remove(run.claimToken)
             try { store.release(run) } catch (Exception ignored) { }
         }
     }
 
-    private void runOnce(DueRun run, int attempt) {
+    private void runOnce(DueRun run, int attempt, boolean recovered) {
         Task task = run.task
+        if (recovered && attempt == 1) {
+            mRecovered.increment()
+        }
+        mStarted.increment()
+        recordTaskTagCounter('gron.runs.started', task, null)
+
         Instant started = clock.instant()
         Instant nextRun = task.schedule.nextRunAfter(run.plannedTime)
         TaskContext ctx = new TaskContext([
@@ -384,31 +481,51 @@ class GronScheduler implements TaskScheduler {
         ])
         activeContexts.put(run.claimToken, ctx)
         fireBeforeRun(ctx)
+        long t0 = System.nanoTime()
         try {
             invokeHandler(task, ctx)
+            long elapsed = System.nanoTime() - t0
             activeContexts.remove(run.claimToken)
             inflight.remove(run.claimToken)
-            store.complete(run, RunOutcome.OK, nextRun)
+            completeStore(run, RunOutcome.OK)
+            mCompletedOk.increment()
+            mDurationOk.record(elapsed)
+            recordTaskTagCounter('gron.runs.completed', task, 'ok')
+            recordTaskTagTimer(task, 'ok', elapsed)
+            recordHistory(task, run, ctx, started, RunOutcome.OK, attempt, recovered, null)
             fireAfterRun(ctx, RunOutcome.OK)
-        } catch (Throwable t) {
+        } catch (Throwable err) {
+            long elapsed = System.nanoTime() - t0
             activeContexts.remove(run.claimToken)
-            fireError(ctx, t)
+            mCompletedFailed.increment()
+            mDurationFailed.record(elapsed)
+            recordTaskTagCounter('gron.runs.completed', task, 'failed')
+            recordTaskTagTimer(task, 'failed', elapsed)
+            recordHistory(task, run, ctx, started, RunOutcome.FAILED, attempt, recovered, err)
+            fireError(ctx, err)
             if (attempt <= task.maxRetries) {
+                mRetried.increment()
                 log.warn('Task {} attempt {} failed ({}); retrying in {}',
-                        task.id, attempt, t.toString(), task.retryDelay)
-                scheduleRetry(run, attempt + 1, task.retryDelay)
+                        task.id, attempt, err.toString(), task.retryDelay)
+                scheduleRetry(run, attempt + 1, recovered, task.retryDelay)
             } else {
                 inflight.remove(run.claimToken)
-                store.complete(run, RunOutcome.FAILED, nextRun)
+                completeStore(run, RunOutcome.FAILED)
                 fireAfterRun(ctx, RunOutcome.FAILED)
-                if (t instanceof TaskFailedException && ((TaskFailedException) t).abortSchedule) {
+                if (err instanceof TaskFailedException && ((TaskFailedException) err).abortSchedule) {
                     log.error('Task {} aborted its schedule (moved to FAILED)', task.id)
                     store.setFailed(task.id)
                 } else {
-                    log.error('Task {} failed after {} attempt(s)', task.id, attempt, t)
+                    log.error('Task {} failed after {} attempt(s)', task.id, attempt, err)
                 }
             }
         }
+    }
+
+    private void completeStore(DueRun run, RunOutcome outcome) {
+        long t0 = System.nanoTime()
+        store.complete(run, outcome, run.task.schedule.nextRunAfter(run.plannedTime))
+        mStoreComplete.record(System.nanoTime() - t0)
     }
 
     private void invokeHandler(Task task, TaskContext ctx) {
@@ -420,14 +537,158 @@ class GronScheduler implements TaskScheduler {
         }
     }
 
-    private void scheduleRetry(DueRun run, int nextAttempt, Duration delay) {
+    private void scheduleRetry(DueRun run, int nextAttempt, boolean recovered, Duration delay) {
         try {
-            retryExecutor.schedule({ dispatch(run, nextAttempt) } as Runnable,
+            retryExecutor.schedule({ dispatch(run, nextAttempt, recovered) } as Runnable,
                     Math.max(0L, delay.toMillis()), TimeUnit.MILLISECONDS)
         } catch (RejectedExecutionException e) {
             inflight.remove(run.claimToken)
             try { store.release(run) } catch (Exception ignored) { }
         }
+    }
+
+    // ------------------------------------------------------- skip handling
+
+    private void onSkipped(String taskId, Instant plannedTime, SkipReason reason) {
+        if (reason == SkipReason.OVERLAP) {
+            mSkipOverlap.increment()
+        } else {
+            mSkipOverdue.increment()
+        }
+        Task task = store.find(taskId)
+        recordSkipHistory(task, taskId, plannedTime, reason)
+        fireSkip(taskId, plannedTime, reason)
+    }
+
+    // ------------------------------------------------------- history
+
+    private HistoryMode effectiveMode(Task task) {
+        if (task != null && task.historyMode != null) {
+            return task.historyMode
+        }
+        return historyPolicy.mode
+    }
+
+    private boolean shouldRecord(HistoryMode mode, RunOutcome outcome) {
+        if (mode == HistoryMode.OFF) {
+            return false
+        }
+        if (mode == HistoryMode.ALL) {
+            return true
+        }
+        return outcome == RunOutcome.FAILED || outcome == RunOutcome.SKIPPED
+    }
+
+    private void recordHistory(Task task, DueRun run, TaskContext ctx, Instant started,
+                               RunOutcome outcome, int attempt, boolean recovered, Throwable err) {
+        if (historyWriter == null || !shouldRecord(effectiveMode(task), outcome)) {
+            return
+        }
+        Instant finished = clock.instant()
+        Map<String, Object> args = new LinkedHashMap<>()
+        args.put('runId', run.claimToken)
+        args.put('taskId', task.id)
+        args.put('tags', task.tags)
+        args.put('plannedTime', run.plannedTime)
+        args.put('startedAt', started)
+        args.put('finishedAt', finished)
+        args.put('durationMillis', Duration.between(started, finished).toMillis())
+        args.put('nodeId', nodeId)
+        args.put('attempt', attempt)
+        args.put('outcome', outcome)
+        args.put('recovered', recovered)
+        if (err != null) {
+            args.put('errorType', err.getClass().name)
+            args.put('errorMessage', truncate(err.message, 1000))
+            args.put('errorStackTrace', truncate(stackTrace(err), historyPolicy.stackTraceLimit))
+        }
+        historyWriter.submit(new RunRecord(args))
+    }
+
+    private void recordSkipHistory(Task task, String taskId, Instant plannedTime, SkipReason reason) {
+        if (historyWriter == null || !shouldRecord(effectiveMode(task), RunOutcome.SKIPPED)) {
+            return
+        }
+        Map<String, Object> args = new LinkedHashMap<>()
+        args.put('runId', UUID.randomUUID().toString())
+        args.put('taskId', taskId)
+        args.put('tags', task == null ? ([] as Set) : task.tags)
+        args.put('plannedTime', plannedTime)
+        args.put('nodeId', nodeId)
+        args.put('attempt', 1)
+        args.put('outcome', RunOutcome.SKIPPED)
+        args.put('skipReason', reason)
+        historyWriter.submit(new RunRecord(args))
+    }
+
+    // ------------------------------------------------------- metrics helpers
+
+    private void cacheMetricHandles() {
+        Map<String, String> nodeTag = Collections.singletonMap('node', nodeId)
+        mStarted = metrics.counter('gron.runs.started', nodeTag)
+        mCompletedOk = metrics.counter('gron.runs.completed', outcomeNode('ok'))
+        mCompletedFailed = metrics.counter('gron.runs.completed', outcomeNode('failed'))
+        mRetried = metrics.counter('gron.runs.retried', Collections.<String, String> emptyMap())
+        mRecovered = metrics.counter('gron.runs.recovered', Collections.<String, String> emptyMap())
+        mSkipOverlap = metrics.counter('gron.runs.skipped', Collections.singletonMap('reason', 'overlap'))
+        mSkipOverdue = metrics.counter('gron.runs.skipped', Collections.singletonMap('reason', 'overdue'))
+        mDurationOk = metrics.timer('gron.run.duration', Collections.singletonMap('outcome', 'ok'))
+        mDurationFailed = metrics.timer('gron.run.duration', Collections.singletonMap('outcome', 'failed'))
+        mStoreClaim = metrics.timer('gron.store.claim.duration', Collections.<String, String> emptyMap())
+        mStoreComplete = metrics.timer('gron.store.complete.duration', Collections.<String, String> emptyMap())
+    }
+
+    private Map<String, String> outcomeNode(String outcome) {
+        Map<String, String> m = new LinkedHashMap<>()
+        m.put('outcome', outcome)
+        m.put('node', nodeId)
+        return m
+    }
+
+    private void recordTaskTagCounter(String name, Task task, String outcome) {
+        if (!task.metricsTaskTag) {
+            return
+        }
+        Map<String, String> tags = new LinkedHashMap<>()
+        tags.put('node', nodeId)
+        if (outcome != null) {
+            tags.put('outcome', outcome)
+        }
+        tags.put('task', task.id)
+        metrics.counter(name, tags).increment()
+    }
+
+    private void recordTaskTagTimer(Task task, String outcome, long nanos) {
+        if (!task.metricsTaskTag) {
+            return
+        }
+        Map<String, String> tags = new LinkedHashMap<>()
+        tags.put('outcome', outcome)
+        tags.put('task', task.id)
+        metrics.timer('gron.run.duration', tags).record(nanos)
+    }
+
+    private void registerGauges() {
+        Map<String, String> none = Collections.<String, String> emptyMap()
+        metrics.gauge('gron.runs.active', none, { (Number) activeContexts.size() } as Supplier<Number>)
+        metrics.gauge('gron.runs.overdue', none, {
+            (store instanceof StoreStats) ? (Number) ((StoreStats) store).backlogCount(clock.instant()) : (Number) 0
+        } as Supplier<Number>)
+        metrics.gauge('gron.tasks.total', none, {
+            (store instanceof StoreStats) ? (Number) ((StoreStats) store).taskCount() : (Number) store.findAll().size()
+        } as Supplier<Number>)
+        metrics.gauge('gron.tasks.paused', none, {
+            (store instanceof StoreStats) ? (Number) ((StoreStats) store).pausedCount() : (Number) 0
+        } as Supplier<Number>)
+        metrics.gauge('gron.workers.busy', none, {
+            (Number) (workerPool == null ? 0 : workerPool.getActiveCount())
+        } as Supplier<Number>)
+        metrics.gauge('gron.queue.depth', none, {
+            (Number) (workerPool == null ? 0 : workerPool.getQueue().size())
+        } as Supplier<Number>)
+        metrics.gauge('gron.cluster.nodes.active', none, {
+            (Number) coordinator.activeNodes().size()
+        } as Supplier<Number>)
     }
 
     // ------------------------------------------------------- maintenance
@@ -443,6 +704,21 @@ class GronScheduler implements TaskScheduler {
         }
     }
 
+    private void housekeeping() {
+        try {
+            Duration retention = historyPolicy.retention
+            if (retention != null && !retention.isZero() && !retention.isNegative()) {
+                Instant cutoff = clock.instant().minus(retention)
+                long deleted = historyStore.deleteOlderThan(cutoff)
+                if (deleted > 0) {
+                    log.debug('History retention deleted {} record(s) older than {}', deleted, cutoff)
+                }
+            }
+        } catch (Throwable t) {
+            log.warn('History housekeeping failed: {}', t.toString())
+        }
+    }
+
     private void recoverNode(String deadNodeId) {
         log.warn('Detected dead node {}; running fail-over recovery', deadNodeId)
         AutoCloseable lock = null
@@ -451,7 +727,7 @@ class GronScheduler implements TaskScheduler {
             List<DueRun> recovered = store.reclaimFromDeadNode(deadNodeId)
             for (DueRun run : recovered) {
                 inflight.put(run.claimToken, run)
-                dispatch(run, 1)
+                dispatch(run, 1, true)
             }
             if (!recovered.isEmpty()) {
                 log.warn('Recovered {} recoverable run(s) from dead node {}',
@@ -494,7 +770,7 @@ class GronScheduler implements TaskScheduler {
 
     private void applyRemote(TaskChangeEvent event) {
         if (event.originNodeId == nodeId) {
-            return   // ignore our own echoes
+            return
         }
         try {
             switch (event.type) {
@@ -513,7 +789,6 @@ class GronScheduler implements TaskScheduler {
                     wakeLoop()
                     break
                 case TaskChangeEvent.Type.RUN_COMPLETED:
-                    // EVERY_NODE nodes run locally; nothing to apply.
                     break
             }
         } catch (Exception e) {
@@ -551,6 +826,21 @@ class GronScheduler implements TaskScheduler {
         log.warn('Listener {} threw {}: {}', callback, e.getClass().simpleName, e.message)
     }
 
+    // ------------------------------------------------------- utils
+
+    private static String stackTrace(Throwable t) {
+        StringWriter sw = new StringWriter()
+        t.printStackTrace(new PrintWriter(sw))
+        return sw.toString()
+    }
+
+    private static String truncate(String s, int limit) {
+        if (s == null) {
+            return null
+        }
+        return s.length() > limit ? s.substring(0, limit) : s
+    }
+
     private void quietSleep(long ms) {
         try {
             Thread.sleep(ms)
@@ -571,19 +861,15 @@ class GronScheduler implements TaskScheduler {
         }
     }
 
-    /**
-     * Fluent builder for {@link GronScheduler}. All configuration goes through
-     * here (no properties machinery).
-     */
+    /** Fluent builder for {@link GronScheduler}. */
     @CompileStatic
     static class Builder {
-        // Package-visible (not private) so the enclosing constructor can read
-        // them under @CompileStatic, mirroring the Task.Builder pattern.
         protected String name = 'gron'
         protected String nodeId = 'node-' + UUID.randomUUID().toString().substring(0, 8)
         protected Set<String> nodeTags = new LinkedHashSet<>()
         protected int workers = 4
-        protected int batchLimit = 100
+        protected int claimBatch = 100
+        protected int workerQueue = -1                 // default: workers * 2
         protected TaskStore store
         protected ClusterCoordinator coordinator
         protected ReplicationProvider replication = new NoOpReplicationProvider()
@@ -593,6 +879,9 @@ class GronScheduler implements TaskScheduler {
         protected ClassLoader classLoader = Thread.currentThread().contextClassLoader
         protected Duration maintenanceInterval = Duration.ofSeconds(5)
         protected Duration maxSleep = Duration.ofSeconds(30)
+        protected MetricsCollector metrics = new SimpleMetrics()
+        protected HistoryStore historyStore
+        protected HistoryPolicy historyPolicy = new HistoryPolicy()
 
         Builder name(String value) { this.name = value; return this }
 
@@ -602,7 +891,9 @@ class GronScheduler implements TaskScheduler {
 
         Builder workers(int value) { this.workers = value; return this }
 
-        Builder batchLimit(int value) { this.batchLimit = value; return this }
+        Builder claimBatch(int value) { this.claimBatch = value; return this }
+
+        Builder workerQueue(int value) { this.workerQueue = value; return this }
 
         Builder store(TaskStore value) { this.store = value; return this }
 
@@ -622,6 +913,12 @@ class GronScheduler implements TaskScheduler {
 
         Builder maxSleep(Duration value) { this.maxSleep = value; return this }
 
+        Builder metrics(MetricsCollector value) { this.metrics = value; return this }
+
+        Builder history(HistoryStore value) { this.historyStore = value; return this }
+
+        Builder historyPolicy(HistoryPolicy value) { this.historyPolicy = value; return this }
+
         GronScheduler build() {
             if (store == null) {
                 store = new MemoryTaskStore()
@@ -632,12 +929,22 @@ class GronScheduler implements TaskScheduler {
             if (coordinator == null) {
                 coordinator = new SingleNodeCoordinator(nodeId, nodeTags, clock)
             }
+            if (metrics == null) {
+                metrics = new SimpleMetrics()
+            }
+            if (historyPolicy == null) {
+                historyPolicy = new HistoryPolicy()
+            }
+            if (historyStore == null) {
+                historyStore = new MemoryHistoryStore(historyPolicy.buffer)
+            }
             if (workers < 1) {
                 throw new IllegalArgumentException('workers must be at least 1')
             }
-            return new GronScheduler(name, nodeId, workers, batchLimit, store, coordinator,
+            int queue = workerQueue > 0 ? workerQueue : workers * 2
+            return new GronScheduler(name, nodeId, workers, claimBatch, queue, store, coordinator,
                     replication, serializer, handlerFactory, clock, classLoader,
-                    maintenanceInterval, maxSleep)
+                    maintenanceInterval, maxSleep, metrics, historyStore, historyPolicy)
         }
     }
 }

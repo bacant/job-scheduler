@@ -1,5 +1,6 @@
 package de.example.gron.api
 
+import de.example.gron.history.HistoryMode
 import de.example.gron.schedule.CronSchedule
 import de.example.gron.schedule.IntervalSchedule
 import de.example.gron.schedule.OneTimeSchedule
@@ -78,6 +79,12 @@ class Task implements Serializable {
     /** Whether the task starts paused; default false. */
     final boolean startPaused
 
+    /** Per-task history mode override; {@code null} = use the global policy. */
+    final HistoryMode historyMode
+
+    /** Whether run metrics for this task carry an extra {@code task} tag; default false. */
+    final boolean metricsTaskTag
+
     private Task(Builder b) {
         this.id = b.id
         this.tags = Collections.unmodifiableSet(new LinkedHashSet<String>(b.tags))
@@ -93,6 +100,8 @@ class Task implements Serializable {
         this.recoverable = b.recoverable
         this.placement = b.placement
         this.startPaused = b.startPaused
+        this.historyMode = b.historyMode
+        this.metricsTaskTag = b.metricsTaskTag
     }
 
     /**
@@ -145,6 +154,8 @@ class Task implements Serializable {
         boolean recoverable = false
         Placement placement = Placement.defaults()
         boolean startPaused = false
+        HistoryMode historyMode = null
+        boolean metricsTaskTag = false
 
         Builder(String id) {
             if (id == null || id.trim().isEmpty()) {
@@ -255,6 +266,23 @@ class Task implements Serializable {
         /** Sets whether the task is recoverable. */
         void recoverable(boolean value) {
             this.recoverable = value
+        }
+
+        /** Overrides the history mode for this task (e.g. {@code OFF} for noisy heartbeats). */
+        void history(HistoryMode mode) {
+            this.historyMode = mode
+        }
+
+        /**
+         * Configures per-task metric options. Currently supports
+         * {@code metrics taskTag: true}, which adds a {@code task} tag to this
+         * task's {@code gron.runs.*}/{@code gron.run.duration} series. Opt-in
+         * because a high task count would otherwise explode metric cardinality.
+         */
+        void metrics(Map<String, ?> options) {
+            if (options != null && Boolean.TRUE == options.get('taskTag')) {
+                this.metricsTaskTag = true
+            }
         }
 
         /** Marks the task to start paused. */

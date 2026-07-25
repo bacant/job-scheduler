@@ -14,8 +14,8 @@ import de.example.gron.spi.AdHocRunSupport
 import de.example.gron.spi.DueRun
 import de.example.gron.spi.DueTimeAware
 import de.example.gron.spi.NodeInfo
-import de.example.gron.spi.SkipSink
 import de.example.gron.spi.StoreContext
+import de.example.gron.spi.StoreStats
 import de.example.gron.spi.TaskStore
 import groovy.transform.CompileStatic
 import org.slf4j.Logger
@@ -24,28 +24,49 @@ import org.slf4j.LoggerFactory
 import java.time.Clock
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.ConcurrentSkipListMap
 import java.util.concurrent.locks.ReentrantLock
 
 /**
  * Shared reference implementation of the overlap / catch-up / placement claim
- * semantics for single-node stores. State is held in memory in a
- * {@code HashMap} plus a {@code TreeSet} index ordered by ({@code nextRun}, id),
- * so due lookups are logarithmic rather than a full scan.
+ * semantics for single-node stores.
+ *
+ * <p><strong>Due index:</strong> a {@link ConcurrentSkipListMap} keyed by
+ * ({@code plannedTime}, {@code taskId}) gives O(log n) submit/reschedule and an
+ * ordered head for finding due runs — there is never a full scan per tick, so
+ * throughput scales with the number of tasks.</p>
  *
  * <p>Subclasses supply persistence by overriding {@link #persist(Entry)},
- * {@link #removePersisted(String)} and {@link #loadOnOpen()}. The in-memory
- * store leaves these empty; the file store writes JSON documents.</p>
+ * {@link #removePersisted(String)} and {@link #loadOnOpen()}.</p>
  *
- * <p><strong>Lock ordering:</strong> a single {@link ReentrantLock} guards all
- * mutable state and is a leaf lock — the store never invokes listeners,
- * handlers or the signaler while holding it. Skip notifications are collected
- * under the lock and dispatched after releasing it. Persistence hooks run under
- * the lock (single-node stores favour correctness over write throughput).</p>
+ * <p><strong>Lock ordering:</strong> a single {@link ReentrantLock} guards the
+ * compound state transitions (claiming advances a cursor, mutates claim
+ * bookkeeping and the index together). It is a leaf lock — the store never
+ * invokes listeners, handlers or the signaler while holding it; skips are
+ * collected under the lock and dispatched after releasing it. Critical sections
+ * are kept short and are O(1)/O(log n), independent of task count.</p>
  */
 @CompileStatic
-abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRunSupport {
+abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRunSupport, StoreStats {
 
     private static final Logger log = LoggerFactory.getLogger(AbstractInMemoryStore)
+
+    /** Ordering key for the due index. */
+    protected static class DueKey implements Comparable<DueKey> {
+        final Instant plannedTime
+        final String taskId
+
+        DueKey(Instant plannedTime, String taskId) {
+            this.plannedTime = plannedTime
+            this.taskId = taskId
+        }
+
+        @Override
+        int compareTo(DueKey o) {
+            int c = plannedTime <=> o.plannedTime
+            return c != 0 ? c : (taskId <=> o.taskId)
+        }
+    }
 
     /** Per-task mutable state. Active claims are runtime-only (never persisted). */
     protected static class Entry {
@@ -56,38 +77,30 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
         boolean failed
         Instant pendingWait
         boolean warnedNoNode
+        DueKey indexKey                 // current key in the due index, or null
         final Map<String, Instant> activeClaims = new LinkedHashMap<>()
 
         int activeCount() { return activeClaims.size() }
     }
 
-    private final Comparator<Entry> byDue = new Comparator<Entry>() {
-        @Override
-        int compare(Entry a, Entry b) {
-            int c = a.nextRun <=> b.nextRun
-            return c != 0 ? c : (a.task.id <=> b.task.id)
-        }
-    }
-
     protected final Map<String, Entry> tasks = new HashMap<>()
-    private final TreeSet<Entry> dueIndex = new TreeSet<>(byDue)
+    private final ConcurrentSkipListMap<DueKey, Entry> dueIndex = new ConcurrentSkipListMap<>()
     private final Set<Entry> readyWait = new LinkedHashSet<>()
     protected final ReentrantLock lock = new ReentrantLock()
 
+    private int pausedCount = 0
+
     protected Clock clock
-    protected SkipSink skipSink
+    protected de.example.gron.spi.SkipSink skipSink
     protected de.example.gron.spi.Signaler signaler
     protected StoreContext storeContext
 
     // --------------------------------------------------- subclass hooks
 
-    /** Persists a single entry (task + runtime state). No-op by default. */
     protected void persist(Entry entry) { }
 
-    /** Removes a persisted entry by id. No-op by default. */
     protected void removePersisted(String taskId) { }
 
-    /** Loads persisted entries into {@link #tasks} on open. No-op by default. */
     protected void loadOnOpen() { }
 
     // -------------------------------------------------------- lifecycle
@@ -101,9 +114,11 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
         lock.lock()
         try {
             loadOnOpen()
-            // Rebuild the due index from loaded entries.
             for (Entry e : tasks.values()) {
                 e.activeClaims.clear()
+                if (e.paused) {
+                    pausedCount++
+                }
                 indexAdd(e)
             }
         } finally {
@@ -128,11 +143,17 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
             } else {
                 indexRemove(entry)
                 readyWait.remove(entry)
+                if (entry.paused) {
+                    pausedCount--
+                }
                 entry.activeClaims.clear()
                 entry.pendingWait = null
             }
             entry.task = task
             entry.paused = task.startPaused
+            if (entry.paused) {
+                pausedCount++
+            }
             entry.failed = false
             entry.previousRun = null
             entry.warnedNoNode = false
@@ -153,6 +174,9 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
             if (entry != null) {
                 indexRemove(entry)
                 readyWait.remove(entry)
+                if (entry.paused) {
+                    pausedCount--
+                }
                 removePersisted(taskId)
                 return true
             }
@@ -209,6 +233,11 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
             Entry e = tasks.get(taskId)
             if (e == null) {
                 return
+            }
+            if (paused && !e.paused) {
+                pausedCount++
+            } else if (!paused && e.paused) {
+                pausedCount--
             }
             e.paused = paused
             if (paused) {
@@ -294,11 +323,14 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
             }
 
             List<Entry> dueEntries = new ArrayList<>()
-            for (Entry e : dueIndex) {
+            for (Entry e : dueIndex.values()) {
                 if (e.nextRun == null || e.nextRun.isAfter(until)) {
                     break
                 }
                 dueEntries.add(e)
+                if (dueEntries.size() >= limit) {
+                    break   // no need to look further than the claim limit
+                }
             }
             for (Entry e : dueEntries) {
                 processDue(e, until, limit, node, now, result, skips, touched)
@@ -439,8 +471,8 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
             if (!readyWait.isEmpty()) {
                 return Instant.EPOCH
             }
-            Entry first = dueIndex.isEmpty() ? null : dueIndex.first()
-            return first?.nextRun
+            Map.Entry<DueKey, Entry> first = dueIndex.firstEntry()
+            return first == null ? null : first.key.plannedTime
         } finally {
             lock.unlock()
         }
@@ -465,6 +497,43 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
         signaler?.signal()
     }
 
+    @Override
+    int taskCount() {
+        lock.lock()
+        try {
+            return tasks.size()
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    @Override
+    int pausedCount() {
+        lock.lock()
+        try {
+            return pausedCount
+        } finally {
+            lock.unlock()
+        }
+    }
+
+    @Override
+    int backlogCount(Instant until) {
+        lock.lock()
+        try {
+            int n = 0
+            for (Entry e : dueIndex.values()) {
+                if (e.nextRun == null || e.nextRun.isAfter(until)) {
+                    break
+                }
+                n++
+            }
+            return n
+        } finally {
+            lock.unlock()
+        }
+    }
+
     // ------------------------------------------------------------- index
 
     private void advance(Entry e, Instant newNextRun) {
@@ -475,12 +544,19 @@ abstract class AbstractInMemoryStore implements TaskStore, DueTimeAware, AdHocRu
 
     private void indexAdd(Entry e) {
         if (!e.paused && !e.failed && e.nextRun != null) {
-            dueIndex.add(e)
+            DueKey key = new DueKey(e.nextRun, e.task.id)
+            e.indexKey = key
+            dueIndex.put(key, e)
+        } else {
+            e.indexKey = null
         }
     }
 
     private void indexRemove(Entry e) {
-        dueIndex.remove(e)
+        if (e.indexKey != null) {
+            dueIndex.remove(e.indexKey)
+            e.indexKey = null
+        }
     }
 
     // ---------------------------------------------------------- placement

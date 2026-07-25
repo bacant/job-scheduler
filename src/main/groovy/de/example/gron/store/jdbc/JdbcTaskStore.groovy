@@ -17,6 +17,7 @@ import de.example.gron.spi.DueTimeAware
 import de.example.gron.spi.NodeInfo
 import de.example.gron.spi.Signaler
 import de.example.gron.spi.StoreContext
+import de.example.gron.spi.StoreStats
 import de.example.gron.spi.TaskStore
 import de.example.gron.util.TimeCodec
 import groovy.sql.GroovyRowResult
@@ -32,18 +33,19 @@ import java.time.Instant
 
 /**
  * A persistent and <strong>shared</strong> {@link TaskStore} backed by JDBC.
- * Uses only {@code java.sql}/{@code javax.sql.DataSource} and
- * {@code groovy.sql.Sql}; the constructor takes a {@link DataSource} (there is
- * no separate connection-provider SPI — connections come from the pool).
  *
- * <p>Due occurrences are claimed atomically per transaction: candidate task
- * rows are locked with {@code SELECT ... FOR UPDATE}, so with several nodes each
- * occurrence advances the cursor exactly once — giving cluster-wide
- * exactly-once execution. Overlap, catch-up and placement mirror the reference
- * {@code AbstractInMemoryStore} semantics.</p>
+ * <p><strong>Optimistic claim path.</strong> In normal operation claims do not
+ * take the global {@code GRON_LOCK}. Candidate task rows are read without a
+ * lock; the claim decision (overlap, catch-up, placement, cursor advance) is
+ * computed in memory, then applied with a conditional
+ * {@code UPDATE ... WHERE ID = ? AND NEXT_RUN <=> observed AND PENDING_WAIT <=>
+ * observed} — a compare-and-set on the schedule cursor. Because the UPDATE takes
+ * the row's write lock, concurrent claimers on the same row serialize and only
+ * one CAS succeeds, giving cluster-wide exactly-once without a global lock.
+ * {@code GRON_LOCK} is used only for recovery/housekeeping.</p>
  */
 @CompileStatic
-class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
+class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport, StoreStats {
 
     private static final Logger log = LoggerFactory.getLogger(JdbcTaskStore)
 
@@ -81,14 +83,12 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
     @Override
     boolean isShared() { return true }
 
-    /** Runs the bundled DDL script (idempotent; uses IF NOT EXISTS). */
     void createSchema() {
-        InputStream in = JdbcTaskStore.getResourceAsStream('/ddl/schema.sql')
-        if (in == null) {
+        InputStream input = JdbcTaskStore.getResourceAsStream('/ddl/schema.sql')
+        if (input == null) {
             throw new TaskStoreException('DDL resource /ddl/schema.sql not found on classpath')
         }
-        // Strip line comments first, then split on ';' (a comment may contain ';').
-        String script = stripComments(in.getText('UTF-8'))
+        String script = stripComments(input.getText('UTF-8'))
         for (String raw : script.split(';')) {
             String stmt = raw.trim()
             if (!stmt.isEmpty()) {
@@ -100,8 +100,7 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
     private static String stripComments(String block) {
         StringBuilder sb = new StringBuilder()
         for (String line : block.split('\n')) {
-            String trimmed = line.trim()
-            if (!trimmed.startsWith('--')) {
+            if (!line.trim().startsWith('--')) {
                 sb.append(line).append('\n')
             }
         }
@@ -112,7 +111,7 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
 
     @Override
     void save(Task task) {
-        String defJson = ctx.serializer.taskToJson(task)   // rejects closure runners
+        String defJson = ctx.serializer.taskToJson(task)
         String tags = wrapTags(task.tags)
         Long nextRun = TimeCodec.toNanos(task.schedule.nextRunAfter(clock.instant()))
         sql.withTransaction {
@@ -151,8 +150,8 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
     @Override
     List<Task> findAll() {
         List<Task> result = new ArrayList<>()
-        sql.eachRow('SELECT DEFINITION FROM GRON_TASK') { row ->
-            result.add(taskFrom(row.getProperty('DEFINITION')))
+        for (GroovyRowResult row : sql.rows('SELECT DEFINITION FROM GRON_TASK')) {
+            result.add(taskFrom(row.DEFINITION))
         }
         return result
     }
@@ -160,8 +159,9 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
     @Override
     List<Task> findByTag(String tag) {
         List<Task> result = new ArrayList<>()
-        sql.eachRow('SELECT DEFINITION FROM GRON_TASK WHERE TAGS LIKE ?', ['%,' + tag + ',%']) { row ->
-            result.add(taskFrom(row.getProperty('DEFINITION')))
+        for (GroovyRowResult row : sql.rows('SELECT DEFINITION FROM GRON_TASK WHERE TAGS LIKE ?',
+                ['%,' + tag + ',%'])) {
+            result.add(taskFrom(row.DEFINITION))
         }
         return result
     }
@@ -208,69 +208,132 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
 
     // --------------------------------------------------------- claiming
 
+    /** In-memory plan produced for a candidate before the CAS. */
+    private static class Plan {
+        Long newNext
+        Long newPending
+        final List<Long> claims = new ArrayList<>()          // planned times (nanos)
+        final List<Object[]> skips = new ArrayList<>()       // [taskId, Instant, SkipReason]
+        boolean changed
+    }
+
     @Override
     List<DueRun> claimDue(Instant until, int limit, NodeInfo node) {
         List<DueRun> result = new ArrayList<>()
-        List<Object[]> skips = new ArrayList<>()
+        List<Object[]> firedSkips = new ArrayList<>()
         Instant now = clock.instant()
         Long untilN = TimeCodec.toNanos(until)
-        sql.withTransaction {
-            List<GroovyRowResult> rows = sql.rows('''SELECT ID, DEFINITION, NEXT_RUN, PENDING_WAIT
-                    FROM GRON_TASK
-                    WHERE PAUSED = FALSE AND FAILED = FALSE
-                      AND ((NEXT_RUN IS NOT NULL AND NEXT_RUN <= ?) OR PENDING_WAIT IS NOT NULL)
-                    ORDER BY NEXT_RUN NULLS FIRST
-                    FOR UPDATE''', [untilN])
-            for (GroovyRowResult row : rows) {
-                if (result.size() >= limit) {
-                    break
+
+        List<GroovyRowResult> candidates = sql.rows('''SELECT ID, DEFINITION, NEXT_RUN, PENDING_WAIT
+                FROM GRON_TASK
+                WHERE PAUSED = FALSE AND FAILED = FALSE
+                  AND ((NEXT_RUN IS NOT NULL AND NEXT_RUN <= ?) OR PENDING_WAIT IS NOT NULL)
+                ORDER BY NEXT_RUN NULLS FIRST
+                FETCH FIRST ''' + Math.max(1, limit) + ' ROWS ONLY', [untilN])
+
+        for (GroovyRowResult row : candidates) {
+            if (result.size() >= limit) {
+                break
+            }
+            String id = (String) row.ID
+            Task task = taskFrom(row.DEFINITION)
+            Long observedNext = asLong(row.NEXT_RUN)
+            Long observedPending = asLong(row.PENDING_WAIT)
+            int active = activeCount(id)
+            Plan plan = planCandidate(task, node, observedNext, observedPending, active, untilN, now,
+                    limit - result.size())
+            if (!plan.changed) {
+                continue
+            }
+            // Apply atomically via compare-and-set on the schedule cursor. If the
+            // CAS loses (another node advanced the same row first), discard the
+            // plan entirely — no claims inserted, no skips fired.
+            List<DueRun> claimed = new ArrayList<>()
+            boolean won = false
+            sql.withTransaction {
+                int updated = casUpdate(id, observedNext, observedPending, plan.newNext, plan.newPending)
+                if (updated == 1) {
+                    won = true
+                    for (Long plannedN : plan.claims) {
+                        String token = UUID.randomUUID().toString()
+                        insertClaim(token, id, plannedN, node.id, now, task.recoverable)
+                        claimed.add(new DueRun(task, TimeCodec.fromNanos(plannedN), node.id, token))
+                    }
                 }
-                processRow(row, untilN, limit, node, now, result, skips)
+            }
+            if (won) {
+                result.addAll(claimed)
+                firedSkips.addAll(plan.skips)
             }
         }
-        for (Object[] s : skips) {
+
+        for (Object[] s : firedSkips) {
             ctx.skipSink?.skipped((String) s[0], (Instant) s[1], (SkipReason) s[2])
         }
         return result
     }
 
-    private void processRow(GroovyRowResult row, Long untilN, int limit, NodeInfo node,
-                            Instant now, List<DueRun> result, List<Object[]> skips) {
-        String id = (String) row.ID
-        Task task = taskFrom(row.DEFINITION)
-        Schedule schedule = task.schedule
-        Long nextN = asLong(row.NEXT_RUN)
-        Long pendingN = asLong(row.PENDING_WAIT)
-        int active = activeCount(id)
-        boolean changed = false
+    /**
+     * Applies the compare-and-set update on the cursor columns.
+     * @return number of rows updated (1 if this claimer won, 0 on contention)
+     */
+    private int casUpdate(String id, Long observedNext, Long observedPending,
+                          Long newNext, Long newPending) {
+        StringBuilder sb = new StringBuilder(
+                'UPDATE GRON_TASK SET NEXT_RUN = ?, PENDING_WAIT = ? WHERE ID = ?')
+        List<Object> params = new ArrayList<>()
+        params.add(newNext)
+        params.add(newPending)
+        params.add(id)
+        if (observedNext == null) {
+            sb.append(' AND NEXT_RUN IS NULL')
+        } else {
+            sb.append(' AND NEXT_RUN = ?'); params.add(observedNext)
+        }
+        if (observedPending == null) {
+            sb.append(' AND PENDING_WAIT IS NULL')
+        } else {
+            sb.append(' AND PENDING_WAIT = ?'); params.add(observedPending)
+        }
+        return sql.executeUpdate(sb.toString(), params)
+    }
 
-        // Deferred WAIT run that is now free to start.
-        if (pendingN != null && active == 0 && result.size() < limit) {
-            insertClaim(id, pendingN, node.id, now, task.recoverable)
-            result.add(new DueRun(task, TimeCodec.fromNanos(pendingN), node.id, lastToken))
+    /** Mirrors the in-memory reference semantics without touching the database. */
+    private Plan planCandidate(Task task, NodeInfo node, Long observedNext, Long observedPending,
+                               int active, Long untilN, Instant now, int remaining) {
+        Schedule schedule = task.schedule
+        Plan plan = new Plan()
+        Long nextN = observedNext
+        Long pendingN = observedPending
+        int localActive = active
+        int slots = remaining
+
+        // Deferred WAIT run ready to start.
+        if (pendingN != null && localActive == 0 && slots > 0) {
+            plan.claims.add(pendingN)
             pendingN = null
-            active++
-            changed = true
+            localActive++
+            slots--
+            plan.changed = true
         }
 
-        while (nextN != null && nextN <= untilN && result.size() < limit) {
+        while (nextN != null && nextN <= untilN && slots > 0) {
             Instant planned = TimeCodec.fromNanos(nextN)
 
             if (!placementAllows(task, node, planned, now)) {
-                // Shared store: leave the occurrence for a matching node.
-                break
+                break   // leave for a matching node
             }
 
-            if (active > 0) {
+            if (localActive > 0) {
                 if (task.overlap == OverlapPolicy.SKIP) {
-                    skips.add([id, planned, SkipReason.OVERLAP] as Object[])
+                    plan.skips.add([task.id, planned, SkipReason.OVERLAP] as Object[])
                     nextN = TimeCodec.toNanos(schedule.nextRunAfter(planned))
-                    changed = true
+                    plan.changed = true
                     continue
                 } else if (task.overlap == OverlapPolicy.WAIT) {
                     pendingN = nextN
                     nextN = TimeCodec.toNanos(schedule.nextRunAfter(planned))
-                    changed = true
+                    plan.changed = true
                     continue
                 }
             }
@@ -279,9 +342,9 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
             Long cursor
             if (overdue) {
                 if (task.catchUp == CatchUpPolicy.SKIP) {
-                    skips.add([id, planned, SkipReason.OVERDUE] as Object[])
+                    plan.skips.add([task.id, planned, SkipReason.OVERDUE] as Object[])
                     nextN = TimeCodec.toNanos(schedule.nextRunAfter(now))
-                    changed = true
+                    plan.changed = true
                     continue
                 } else if (task.catchUp == CatchUpPolicy.RUN_ONCE) {
                     cursor = TimeCodec.toNanos(schedule.nextRunAfter(now))
@@ -292,29 +355,24 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
                 cursor = TimeCodec.toNanos(schedule.nextRunAfter(planned))
             }
 
-            insertClaim(id, nextN, node.id, now, task.recoverable)
-            result.add(new DueRun(task, planned, node.id, lastToken))
-            active++
+            plan.claims.add(nextN)
+            localActive++
+            slots--
             nextN = cursor
-            changed = true
+            plan.changed = true
         }
 
-        if (changed) {
-            sql.executeUpdate('UPDATE GRON_TASK SET NEXT_RUN = ?, PENDING_WAIT = ? WHERE ID = ?',
-                    [nextN, pendingN, id])
-        }
+        plan.newNext = nextN
+        plan.newPending = pendingN
+        return plan
     }
 
-    private String lastToken
-
-    private void insertClaim(String taskId, Long plannedN, String nodeId, Instant now,
+    private void insertClaim(String token, String taskId, Long plannedN, String nodeId, Instant now,
                              boolean recoverable) {
-        String token = UUID.randomUUID().toString()
         sql.executeUpdate('''INSERT INTO GRON_RUN
                 (CLAIM_TOKEN, TASK_ID, PLANNED_TIME, CLAIMED_BY, CLAIMED_AT, RECOVERABLE)
                 VALUES (?, ?, ?, ?, ?, ?)''',
                 [token, taskId, plannedN, nodeId, TimeCodec.toNanos(now), recoverable])
-        this.lastToken = token
     }
 
     private int activeCount(String taskId) {
@@ -358,14 +416,11 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
                 Task task = taskFrom(row.DEFINITION)
                 Long plannedN = asLong(row.PLANNED_TIME)
                 if (Boolean.TRUE == row.RECOVERABLE) {
-                    // Keep the claim row; hand it back to the recovering node as an
-                    // immediate one-off run with the original planned time.
                     recovered.add(new DueRun(task, TimeCodec.fromNanos(plannedN), nodeId,
                             (String) row.CLAIM_TOKEN))
                 } else {
                     sql.executeUpdate('DELETE FROM GRON_RUN WHERE CLAIM_TOKEN = ?',
                             [row.CLAIM_TOKEN])
-                    // Free the occurrence so the catch-up policy applies on the next claim.
                     sql.executeUpdate('''UPDATE GRON_TASK SET NEXT_RUN =
                             CASE WHEN NEXT_RUN IS NULL OR ? < NEXT_RUN THEN ? ELSE NEXT_RUN END
                             WHERE ID = ?''', [plannedN, plannedN, task.id])
@@ -397,6 +452,29 @@ class JdbcTaskStore implements TaskStore, DueTimeAware, AdHocRunSupport {
                 CASE WHEN NEXT_RUN IS NULL OR ? < NEXT_RUN THEN ? ELSE NEXT_RUN END
                 WHERE ID = ? AND PAUSED = FALSE AND FAILED = FALSE''', [nowN, nowN, taskId])
         signaler?.signal()
+    }
+
+    @Override
+    int taskCount() {
+        return count('SELECT COUNT(*) AS C FROM GRON_TASK')
+    }
+
+    @Override
+    int pausedCount() {
+        return count('SELECT COUNT(*) AS C FROM GRON_TASK WHERE PAUSED = TRUE')
+    }
+
+    @Override
+    int backlogCount(Instant until) {
+        GroovyRowResult r = sql.firstRow('''SELECT COUNT(*) AS C FROM GRON_TASK
+                WHERE PAUSED = FALSE AND FAILED = FALSE AND NEXT_RUN IS NOT NULL AND NEXT_RUN <= ?''',
+                [TimeCodec.toNanos(until)])
+        return ((Number) r.C).intValue()
+    }
+
+    private int count(String query) {
+        GroovyRowResult r = sql.firstRow(query)
+        return ((Number) r.C).intValue()
     }
 
     // -------------------------------------------------------------- utils

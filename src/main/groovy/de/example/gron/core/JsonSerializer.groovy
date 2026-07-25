@@ -61,6 +61,8 @@ class JsonSerializer implements de.example.gron.spi.Serializer {
         doc.put('recoverable', task.recoverable)
         doc.put('startPaused', task.startPaused)
         doc.put('placement', placementToMap(task.placement))
+        doc.put('historyMode', task.historyMode == null ? null : task.historyMode.name())
+        doc.put('metricsTaskTag', task.metricsTaskTag)
         return doc
     }
 
@@ -101,6 +103,13 @@ class JsonSerializer implements de.example.gron.spi.Serializer {
         b.recoverable((Boolean) doc.get('recoverable'))
         b.startPaused((Boolean) doc.get('startPaused'))
         b.placement(placementFromMap((Map<String, Object>) doc.get('placement')))
+        String hm = (String) doc.get('historyMode')
+        if (hm != null) {
+            b.history(de.example.gron.history.HistoryMode.valueOf(hm))
+        }
+        if (Boolean.TRUE == doc.get('metricsTaskTag')) {
+            b.metrics([taskTag: true])
+        }
         return b.build()
     }
 

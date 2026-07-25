@@ -1,5 +1,9 @@
 package de.example.gron.api
 
+import de.example.gron.history.HistoryQuery
+import de.example.gron.history.RunRecord
+import de.example.gron.metrics.MetricsSnapshot
+
 import java.time.Duration
 
 /**
@@ -64,4 +68,13 @@ interface TaskScheduler {
 
     /** Removes a previously registered listener. */
     void removeListener(TaskListener listener)
+
+    /** @return the most recent run records for a task, newest first. */
+    List<RunRecord> historyOf(String taskId, int limit)
+
+    /** @return run records matching the query, newest first. */
+    List<RunRecord> queryHistory(HistoryQuery query)
+
+    /** @return an immutable metrics snapshot, or an empty one if not readable. */
+    MetricsSnapshot metricsSnapshot()
 }
